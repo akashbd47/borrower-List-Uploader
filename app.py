@@ -181,8 +181,11 @@ def row_to_record(row, program_code, program_name, loan_status, account_code, pa
         "installmentAmount": parse_number(row[11]),
         "receivedAmount": parse_number(row[12]),
         "currentBalance": parse_number(row[13]),
-        "due": parse_number(row[14]),
-        "rescheduleAmount": parse_number(row[15]),
+        # PDF columns: Due No. (index 14), Due Amount (index 15).
+        # Keep "due" for compatibility with existing app consumers.
+        "dueNo": parse_number(row[14]),
+        "due": parse_number(row[15]),
+        "dueAmount": parse_number(row[15]),
         "rescheduleNo": parse_number(row[16]),
         "rescheduleDate": normalize_date(row[17]),
         "lastReceivedAmount": parse_number(row[18]),
@@ -315,8 +318,11 @@ def parse_pdf(pdf_path):
                     "installmentAmount": parse_number(row[11]),
                     "receivedAmount": parse_number(row[12]),
                     "currentBalance": parse_number(row[13]),
-                    "due": parse_number(row[14]),
-                    "rescheduleAmount": parse_number(row[15]),
+                    # PDF columns: Due No. (index 14), Due Amount (index 15).
+                    # Keep "due" for compatibility with existing app consumers.
+                    "dueNo": parse_number(row[14]),
+                    "due": parse_number(row[15]),
+                    "dueAmount": parse_number(row[15]),
                     "rescheduleNo": parse_number(row[16]),
                     "rescheduleDate": normalize_date(row[17]),
                     "lastReceivedAmount": parse_number(row[18]),
