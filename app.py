@@ -181,11 +181,8 @@ def row_to_record(row, program_code, program_name, loan_status, account_code, pa
         "installmentAmount": parse_number(row[11]),
         "receivedAmount": parse_number(row[12]),
         "currentBalance": parse_number(row[13]),
-        # PDF columns: Due No. (index 14), Due Amount (index 15).
-        # Keep "due" for compatibility with existing app consumers.
-        "dueNo": parse_number(row[14]),
-        "due": parse_number(row[15]),
-        "dueAmount": parse_number(row[15]),
+        "due": parse_number(row[14]),
+        "rescheduleAmount": parse_number(row[15]),
         "rescheduleNo": parse_number(row[16]),
         "rescheduleDate": normalize_date(row[17]),
         "lastReceivedAmount": parse_number(row[18]),
@@ -237,8 +234,44 @@ def detect_row_starts(lines):
     return starts
 
 
-def extract_row_cells(lines, start, next_start_top):
-    """Read all wrapped lines for one borrower using the PDF's fixed column x-coordinates."""
+# A word that fills (almost) the whole cell width and continues on the next line with a
+# lowercase fragment was broken in the middle by the report (e.g. "Norosingahp" + "ur").
+MID_WORD_EDGE = 6
+
+
+def column_for_word(word):
+    center = (word["x0"] + word["x1"]) / 2
+    return next((idx for idx in range(21)
+                 if PDF_COLUMN_BOUNDS[idx] <= center < PDF_COLUMN_BOUNDS[idx + 1]), None)
+
+
+def add_line_to_cells(col_lines, line):
+    """Put the words of one visual line into their column buckets (one fragment per line)."""
+    per_column = {}
+    for word in line["words"]:
+        column = column_for_word(word)
+        if column is not None:
+            per_column.setdefault(column, []).append(word)
+    for column, words in per_column.items():
+        col_lines[column].append(words)
+
+
+def join_cell(fragments, column):
+    """Join wrapped lines of one cell. No space is added when a word was split mid-word."""
+    if not fragments:
+        return ""
+    right_edge = PDF_COLUMN_BOUNDS[column + 1]
+    text = " ".join(w["text"] for w in fragments[0])
+    for prev, cur in zip(fragments, fragments[1:]):
+        glue = " "
+        if len(prev) == 1 and prev[0]["x1"] >= right_edge - MID_WORD_EDGE and cur[0]["text"][:1].islower():
+            glue = ""
+        text += glue + " ".join(w["text"] for w in cur)
+    return text.strip()
+
+
+def extract_row_lines(lines, start, next_start_top):
+    """Collect all wrapped lines for one borrower, bucketed by the PDF's fixed column x-coordinates."""
     end_top = next_start_top
     start_index = start["line_index"]
     for line in lines[start_index + 1:]:
@@ -248,19 +281,37 @@ def extract_row_cells(lines, start, next_start_top):
                      r"Loan Status & Account Code|Software Developed", line["text"], re.I):
             end_top = min(end_top, line["top"])
             break
-    cells = [""] * 21
+    col_lines = [[] for _ in range(21)]
     for line in lines[start_index:]:
         if line["top"] >= end_top:
             break
-        for word in line["words"]:
-            center = (word["x0"] + word["x1"]) / 2
-            column = next((idx for idx in range(21)
-                           if PDF_COLUMN_BOUNDS[idx] <= center < PDF_COLUMN_BOUNDS[idx + 1]), None)
-            if column is not None:
-                cells[column] = (cells[column] + " " + word["text"]).strip()
+        add_line_to_cells(col_lines, line)
+    return col_lines
+
+
+def row_cells(col_lines, start):
+    cells = [join_cell(col_lines[idx], idx) for idx in range(21)]
     cells[0] = start["sl_no"]
     cells[1] = start["case_no"]
     return cells
+
+
+def extract_row_cells(lines, start, next_start_top):
+    return row_cells(extract_row_lines(lines, start, next_start_top), start)
+
+
+def continuation_lines(lines, limit_index):
+    """Lines printed under the table header but before the first borrower row of a page.
+    They are the wrapped remainder of the last borrower row of the previous page."""
+    header_index = None
+    for idx in range(limit_index):
+        if re.search(r"Case No", lines[idx]["text"]):
+            header_index = idx
+    if header_index is None:
+        return []
+    skip = re.compile(r"Software Developed|Page \d+ of \d+|Loan Program|Loan Status|"
+                      r"Account Code Wise Total|Print On|Supervisor Name", re.I)
+    return [ln for ln in lines[header_index + 1:limit_index] if not skip.search(ln["text"])]
 
 
 def parse_pdf(pdf_path):
@@ -268,6 +319,7 @@ def parse_pdf(pdf_path):
     parse_warnings = []
     invalid_phones = 0
     candidate_count = 0
+    raw_rows = []  # one entry per borrower row, in PDF order, across all pages
 
     with pdfplumber.open(pdf_path) as pdf:
         if not pdf.pages:
@@ -276,6 +328,13 @@ def parse_pdf(pdf_path):
             lines = group_page_words(page)
             starts = detect_row_starts(lines)
             candidate_count += len(starts)
+
+            # Wrapped text of a row that was split across the page break belongs to the previous page's last row.
+            lead = continuation_lines(lines, starts[0]["line_index"] if starts else len(lines))
+            if lead and raw_rows:
+                for line in lead:
+                    add_line_to_cells(raw_rows[-1]["col_lines"], line)
+
             program_code = program_name = loan_status = account_code = None
             line_cursor = 0
             for row_index, start in enumerate(starts):
@@ -292,50 +351,59 @@ def parse_pdf(pdf_path):
                         account_code = match.group(2)
                 line_cursor = start["line_index"] + 1
                 next_top = starts[row_index + 1]["top"] if row_index + 1 < len(starts) else float("inf")
-                row = extract_row_cells(lines, start, next_top)
-                case_no = clean_cell(row[1])
-                customer_name = clean_cell(row[2])
-                if not re.fullmatch(r"\d+(?:\.\d+)?", case_no):
-                    parse_warnings.append({"page": page_number, "reason": f"Invalid loan case number at Sl. {start['sl_no']}"})
-                    continue
-                if not (program_code and account_code and customer_name):
-                    parse_warnings.append({"page": page_number, "reason": f"Missing programme/account/name at Sl. {start['sl_no']} Case {case_no}"})
-                    continue
+                raw_rows.append({
+                    "col_lines": extract_row_lines(lines, start, next_top),
+                    "start": start, "page": page_number,
+                    "program_code": program_code, "program_name": program_name,
+                    "loan_status": loan_status, "account_code": account_code,
+                })
 
-                phone, phone_invalid = normalize_bd_phone(row[9])
-                record = {
-                    "customerName": customer_name,
-                    "loanCaseNo": case_no,
-                    "loanProgrammeCode": program_code,
-                    "loanProgrammeName": program_name,
-                    "accountCode": account_code,
-                    "loanStatus": loan_status,
-                    "fatherName": blank_to_none(row[3]),
-                    "spouseName": blank_to_none(row[4]),
-                    "village": blank_to_none(row[5]),
-                    "union": blank_to_none(row[7]),
-                    "overdueDate": normalize_date(row[10]),
-                    "installmentAmount": parse_number(row[11]),
-                    "receivedAmount": parse_number(row[12]),
-                    "currentBalance": parse_number(row[13]),
-                    # PDF columns: Due No. (index 14), Due Amount (index 15).
-                    # Keep "due" for compatibility with existing app consumers.
-                    "dueNo": parse_number(row[14]),
-                    "due": parse_number(row[15]),
-                    "dueAmount": parse_number(row[15]),
-                    "rescheduleNo": parse_number(row[16]),
-                    "rescheduleDate": normalize_date(row[17]),
-                    "lastReceivedAmount": parse_number(row[18]),
-                    "lastReceivedDate": normalize_date(row[19]),
-                    "notPaidMonths": parse_number(row[20]),
-                }
-                if phone:
-                    record["phone"] = phone
-                elif phone_invalid:
-                    invalid_phones += 1
-                records.append({"record": record, "phone_invalid": phone_invalid,
-                                "page": page_number, "sl_no": start["sl_no"],
-                                "document_id": f"{program_code}{case_no}"})
+    for raw in raw_rows:
+        start = raw["start"]
+        page_number = raw["page"]
+        program_code, program_name = raw["program_code"], raw["program_name"]
+        loan_status, account_code = raw["loan_status"], raw["account_code"]
+        row = row_cells(raw["col_lines"], start)
+        case_no = clean_cell(row[1])
+        customer_name = clean_cell(row[2])
+        if not re.fullmatch(r"\d+(?:\.\d+)?", case_no):
+            parse_warnings.append({"page": page_number, "reason": f"Invalid loan case number at Sl. {start['sl_no']}"})
+            continue
+        if not (program_code and account_code and customer_name):
+            parse_warnings.append({"page": page_number, "reason": f"Missing programme/account/name at Sl. {start['sl_no']} Case {case_no}"})
+            continue
+
+        phone, phone_invalid = normalize_bd_phone(row[9])
+        record = {
+            "customerName": customer_name,
+            "loanCaseNo": case_no,
+            "loanProgrammeCode": program_code,
+            "loanProgrammeName": program_name,
+            "accountCode": account_code,
+            "loanStatus": loan_status,
+            "fatherName": blank_to_none(row[3]),
+            "spouseName": blank_to_none(row[4]),
+            "village": blank_to_none(row[5]),
+            "union": blank_to_none(row[7]),
+            "overdueDate": normalize_date(row[10]),
+            "installmentAmount": parse_number(row[11]),
+            "receivedAmount": parse_number(row[12]),
+            "currentBalance": parse_number(row[13]),
+            "due": parse_number(row[14]),
+            "rescheduleAmount": parse_number(row[15]),
+            "rescheduleNo": parse_number(row[16]),
+            "rescheduleDate": normalize_date(row[17]),
+            "lastReceivedAmount": parse_number(row[18]),
+            "lastReceivedDate": normalize_date(row[19]),
+            "notPaidMonths": parse_number(row[20]),
+        }
+        if phone:
+            record["phone"] = phone
+        elif phone_invalid:
+            invalid_phones += 1
+        records.append({"record": record, "phone_invalid": phone_invalid,
+                        "page": page_number, "sl_no": start["sl_no"],
+                        "document_id": f"{program_code}{case_no}"})
 
     if not records:
         raise ValueError("No borrower rows were parsed. Existing Firestore data was not changed.")
