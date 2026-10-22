@@ -181,14 +181,18 @@ def row_to_record(row, program_code, program_name, loan_status, account_code, pa
         "installmentAmount": parse_number(row[11]),
         "receivedAmount": parse_number(row[12]),
         "currentBalance": parse_number(row[13]),
-        "due": parse_number(row[14]),
-        "rescheduleAmount": parse_number(row[15]),
+        "dueNo": parse_number(row[14]),
+        "due": parse_number(row[15]),
+        "rescheduleAmount": None,  # set below from currentBalance when rescheduled
+
         "rescheduleNo": parse_number(row[16]),
         "rescheduleDate": normalize_date(row[17]),
         "lastReceivedAmount": parse_number(row[18]),
         "lastReceivedDate": normalize_date(row[19]),
         "notPaidMonths": parse_number(row[20]),
     }
+    if record["rescheduleNo"] and record["rescheduleDate"]:
+        record["rescheduleAmount"] = record["currentBalance"]
     # Keep phone field absent when source phone is invalid/unfinished; do not invent digits.
     if phone:
         record["phone"] = phone
@@ -391,13 +395,17 @@ def parse_pdf(pdf_path):
             "currentBalance": parse_number(row[13]),
             "dueNo": parse_number(row[14]),
             "due": parse_number(row[15]),
-            "rescheduleAmount": parse_number(row[15]),
+            "rescheduleAmount": None,  # set below from currentBalance when rescheduled
+
             "rescheduleNo": parse_number(row[16]),
             "rescheduleDate": normalize_date(row[17]),
             "lastReceivedAmount": parse_number(row[18]),
             "lastReceivedDate": normalize_date(row[19]),
             "notPaidMonths": parse_number(row[20]),
         }
+        # Rule: if rescheduleNo and rescheduleDate both exist, rescheduleAmount = currentBalance.
+        if record["rescheduleNo"] and record["rescheduleDate"]:
+            record["rescheduleAmount"] = record["currentBalance"]
         if phone:
             record["phone"] = phone
         elif phone_invalid:
