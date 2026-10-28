@@ -1,4 +1,9 @@
-"""KB Loan PDF importer. Render + Flask + Firebase Firestore."""
+"""KB Loan PDF importer. Render + Flask + Firebase Firestore.
+
+Upload window has two options:
+  1. Borrower List Uploader      -> LoanMonthlyData (+ MetaData/Loan Data Update)
+  2. All Loan Balance Uploader   -> LoanInfo        (+ MetaData/Loan Balance Update)
+"""
 from __future__ import annotations
 
 import json
@@ -20,6 +25,9 @@ from werkzeug.utils import secure_filename
 COLLECTION = "LoanMonthlyData"
 META_COLLECTION = "MetaData"
 META_DOCUMENT = "Loan Data Update"
+# --- All Loan Balance uploader (second upload option) ---
+LOAN_INFO_COLLECTION = "LoanInfo"
+LOAN_BALANCE_META_DOCUMENT = "Loan Balance Update"   # separate from "Loan Data Update" (borrower list)
 BATCH_SIZE = 400  # Firestore supports up to 500 writes per batch.
 MAX_UPLOAD_MB = 40
 
@@ -443,6 +451,198 @@ def parse_pdf(pdf_path):
                      "invalid_phones": invalid_phones, "parse_warnings": parse_warnings,
                      "missing_balance": missing_balance}
 
+# =====================================================================================
+#  ALL LOAN BALANCE UPLOADER  ->  Firestore collection "LoanInfo"
+#  Document id = programme code + loan case no   (e.g. 0307126, 0101342.1)
+#  Programme code is NOT printed as a column: it is the middle 4 digits of "Loan Sl. No."
+#  (0522-0101-00436 -> 0101).
+# =====================================================================================
+LB_SERIAL_RE = re.compile(r"^(\d{4})-(\d{4})-(\d{5})$")
+LB_CASE_RE = re.compile(r"^\d+(?:\.\d+)?$")
+# Column x-boundaries (PDF points, landscape A4 842 wide) of the "Loan Balance" report.
+LB_BOUNDS = [("sl", 0, 52), ("case", 52, 78), ("serial", 78, 148), ("name", 148, 256), ("phone", 256, 320),
+             ("start", 320, 363), ("duration", 363, 395), ("end", 395, 441),
+             ("debit_p", 441, 476), ("debit_i", 476, 521), ("debit_t", 521, 558),
+             ("credit_p", 558, 594), ("credit_i", 594, 639), ("credit_t", 639, 676),
+             ("bal_p", 676, 712), ("bal_i", 712, 766), ("bal_t", 766, 801), ("class", 801, 10000)]
+
+
+def lb_column(word):
+    center = (word["x0"] + word["x1"]) / 2
+    return next((name for name, lo, hi in LB_BOUNDS if lo <= center < hi), None)
+
+
+def lb_money(cells, key):
+    """Blank money cell (e.g. interest not yet charged) is 0 in this report."""
+    value = parse_number(cells.get(key, ""))
+    return 0 if value is None else value
+
+
+def parse_loan_balance_pdf(pdf_path):
+    """Read the 'Loan Balance' PDF. Raises ValueError unless every row and every total reconciles."""
+    rows, warnings, totals = [], [], []
+    group_sum = [0, 0, 0]
+    report_date = branch = None
+    program_context = None
+
+    with pdfplumber.open(pdf_path) as pdf:
+        if not pdf.pages:
+            raise ValueError("PDF contains no pages.")
+        page_count = len(pdf.pages)
+        for page_number, page in enumerate(pdf.pages, start=1):
+            for line in group_page_words(page):
+                text = line["text"]
+                if page_number == 1:
+                    m = re.search(r"\bDate\s*-\s*(\d{1,2}/\d{1,2}/\d{4})", text)
+                    if m and not report_date:
+                        report_date = normalize_date(m.group(1))
+                    m = re.match(r"^(.+?)\s+Branch$", text)
+                    if m and not branch:
+                        branch = m.group(1).strip()
+                m = re.search(r"\bLoan Program\s*:\s*(\d{4})", text)
+                if m:
+                    program_context = m.group(1)
+                m = re.match(r"^Total:\s*(\d+)\s+(\d+)\s+(\d+)\s*$", text)
+                if m:
+                    totals.append({"page": page_number, "values": [int(x) for x in m.groups()],
+                                   "rows_since_last": group_sum[:]})
+                    group_sum = [0, 0, 0]
+                    continue
+
+                serial_word = next((w for w in line["words"] if LB_SERIAL_RE.match(w["text"])
+                                    and lb_column(w) == "serial"), None)
+                if not serial_word:
+                    continue
+                cells = {}
+                for word in line["words"]:
+                    column = lb_column(word)
+                    if column:
+                        cells[column] = (cells.get(column, "") + " " + word["text"]).strip()
+                serial = serial_word["text"]
+                branch_code, program_code, running_no = LB_SERIAL_RE.match(serial).groups()
+                case_no = clean_cell(cells.get("case", ""))
+                where = f"page {page_number}, Loan Sl. No. {serial}"
+                if not LB_CASE_RE.match(case_no):
+                    warnings.append({"page": page_number, "reason": f"Invalid loan case number at {where}"})
+                    continue
+                if program_context and program_context != program_code:
+                    warnings.append({"page": page_number,
+                                     "reason": f"Programme heading {program_context} differs from Loan Sl. No. {serial}"})
+                money = {k: lb_money(cells, k) for k in ("debit_p", "debit_i", "debit_t", "credit_p", "credit_i",
+                                                          "credit_t", "bal_p", "bal_i", "bal_t")}
+                if (money["debit_p"] + money["debit_i"] != money["debit_t"]
+                        or money["credit_p"] + money["credit_i"] != money["credit_t"]
+                        or money["bal_p"] + money["bal_i"] != money["bal_t"]
+                        or money["debit_p"] - money["credit_p"] != money["bal_p"]
+                        or money["debit_i"] - money["credit_i"] != money["bal_i"]):
+                    warnings.append({"page": page_number, "reason": f"Amounts do not add up at {where}"})
+                    continue
+                start_date = normalize_date(cells.get("start"))
+                duration = parse_number(cells.get("duration", ""))
+                if not start_date or duration is None:
+                    warnings.append({"page": page_number, "reason": f"Missing start date or duration at {where}"})
+                    continue
+                rows.append({
+                    "document_id": f"{program_code}{case_no}",
+                    "page": page_number,
+                    "record": {
+                        "loanCaseNo": case_no,
+                        "loanSlNo": serial,
+                        "loanProgrammeCode": program_code,
+                        "loanStartDate": start_date,
+                        "loanDurationMonths": duration,
+                        "balancePrincipal": money["bal_p"],
+                        "balanceInterest": money["bal_i"],
+                    },
+                })
+                group_sum = [group_sum[0] + money["bal_p"], group_sum[1] + money["bal_i"], group_sum[2] + money["bal_t"]]
+
+    if not rows:
+        raise ValueError("No loan rows were parsed. Is this the 'Loan Balance' report? Existing Firestore data was not changed.")
+    if warnings:
+        raise ValueError(f"{len(warnings)} loan rows could not be read safely. Example: {warnings[:4]}. "
+                         "Existing Firestore data was not changed.")
+    if len(totals) < 2:
+        raise ValueError("The PDF totals were not found (group Total rows and the Grand Total). "
+                         "Existing Firestore data was not changed.")
+
+    # Every group "Total:" and the Grand Total printed in the PDF must match what was read.
+    grand = totals[-1]["values"]
+    group_totals = totals[:-1]
+    for item in group_totals:
+        if item["rows_since_last"][0] != item["values"][0] or item["rows_since_last"][1] != item["values"][1] \
+                or item["rows_since_last"][2] != item["values"][2]:
+            raise ValueError(f"Group total mismatch on page {item['page']}: PDF says {item['values']}, "
+                             f"rows add up to {item['rows_since_last']}. Existing Firestore data was not changed.")
+    read_sum = [sum(r["record"]["balancePrincipal"] for r in rows),
+                sum(r["record"]["balanceInterest"] for r in rows)]
+    read_sum.append(read_sum[0] + read_sum[1])
+    if read_sum != grand:
+        raise ValueError(f"Grand total mismatch: PDF says {grand}, rows add up to {read_sum}. "
+                         "Existing Firestore data was not changed.")
+
+    seen, duplicates = set(), []
+    for item in rows:
+        if item["document_id"] in seen:
+            duplicates.append(item["document_id"])
+        seen.add(item["document_id"])
+    if duplicates:
+        raise ValueError(f"Duplicate document IDs detected ({len(duplicates)}): {', '.join(duplicates[:10])}. "
+                         "Existing Firestore data was not changed.")
+
+    return rows, {"pages": page_count, "records": len(rows), "groups": len(group_totals), "grand": grand,
+                  "report_date": report_date, "branch": branch}
+
+
+def process_loan_balance_file(path, job_id, replace_old):
+    started = time.monotonic()
+    try:
+        set_job(job_id, status="processing", phase="Parsing PDF")
+        records, stats = parse_loan_balance_pdf(path)
+        report = [["PDF pages", stats["pages"]], ["Loan rows read", stats["records"]],
+                  ["Groups checked", stats["groups"]],
+                  ["Balance total (PDF = rows)", f"{stats['grand'][2]:,}"],
+                  ["Report date", stats["report_date"] or "—"], ["Branch", stats["branch"] or "—"]]
+        set_job(job_id, phase="Validation complete", totalPages=stats["pages"], totalRecords=stats["records"], stats=report)
+        col = db.collection(LOAN_INFO_COLLECTION)
+        deleted = 0
+        if replace_old:
+            set_job(job_id, phase="Deleting old Loan Info", deleted=0, inserted=0)
+            deleted = delete_existing_documents(col, job_id)
+        set_job(job_id, phase="Uploading Loan Info", deleted=deleted, inserted=0)
+        inserted = 0
+        for start in range(0, len(records), BATCH_SIZE):
+            part = records[start:start + BATCH_SIZE]
+            batch = db.batch()
+            for item in part:
+                batch.set(col.document(item["document_id"]), item["record"])
+            batch.commit()
+            inserted += len(part)
+            set_job(job_id, phase="Uploading Loan Info", inserted=inserted, totalRecords=len(records))
+        db.collection(META_COLLECTION).document(LOAN_BALANCE_META_DOCUMENT).set({
+            "updateTime": firestore.SERVER_TIMESTAMP,
+            "sourceFile": JOBS[job_id].get("filename"),
+            "totalRecords": inserted,
+            "totalPages": stats["pages"],
+            "reportDate": stats["report_date"],
+            "branch": stats["branch"],
+            "replacedOldData": bool(replace_old),
+        }, merge=True)
+        report += [["Old Loan Info deleted", deleted], ["Loan Info inserted / updated", inserted]]
+        set_job(job_id, status="completed", phase="Completed", deleted=deleted, inserted=inserted, stats=report,
+                elapsedSeconds=round(time.monotonic() - started, 2),
+                finishedAt=datetime.utcnow().isoformat(timespec="seconds") + "Z")
+    except Exception as exc:
+        app.logger.exception("Loan balance import job %s failed", job_id)
+        set_job(job_id, status="failed", phase="Failed", error=str(exc),
+                elapsedSeconds=round(time.monotonic() - started, 2))
+    finally:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def set_job(job_id, **changes):
     with JOBS_LOCK:
         if job_id in JOBS:
@@ -531,8 +731,10 @@ def upload_api():
         return jsonify({"error": "Please choose a PDF file."}), 400
     if Path(file.filename).suffix.lower() != ".pdf":
         return jsonify({"error": "Only PDF files are allowed."}), 400
+    kind = "balance" if request.form.get("kind") == "balance" else "borrower"
+    replace_old = request.form.get("replace") == "1"
     job_id = uuid.uuid4().hex
-    safe_name = secure_filename(file.filename) or "borrower-list.pdf"
+    safe_name = secure_filename(file.filename) or ("loan-balance.pdf" if kind == "balance" else "borrower-list.pdf")
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(prefix="kb-loan-", suffix=".pdf", delete=False) as tmp:
@@ -540,12 +742,15 @@ def upload_api():
             file.save(tmp)
         with JOBS_LOCK:
             JOBS[job_id] = {
-                "jobId": job_id, "filename": safe_name, "status": "queued", "phase": "Queued",
+                "jobId": job_id, "filename": safe_name, "kind": kind, "status": "queued", "phase": "Queued",
                 "createdAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 "updatedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 "totalPages": 0, "totalRecords": 0, "deleted": 0, "inserted": 0,
             }
-        thread = threading.Thread(target=process_file, args=(temp_path, job_id), daemon=True)
+        if kind == "balance":
+            thread = threading.Thread(target=process_loan_balance_file, args=(temp_path, job_id, replace_old), daemon=True)
+        else:
+            thread = threading.Thread(target=process_file, args=(temp_path, job_id), daemon=True)
         thread.start()
         return jsonify({"jobId": job_id, "status": "queued", "message": "PDF uploaded. Background processing started."}), 202
     except Exception as exc:
@@ -574,17 +779,25 @@ def too_large(_error):
 PAGE_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>KB Loan PDF Importer</title><style>
-:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#182230;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial}.wrap{max-width:650px;margin:32px auto;padding:16px}.card{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:24px;box-shadow:0 8px 28px #1822300d}h1{font-size:24px;margin:0 0 6px}.muted{color:#667085}.file{display:block;width:100%;margin:20px 0;padding:12px;border:1px dashed #98a2b3;border-radius:10px;background:#fafbff}button{width:100%;padding:13px;border:0;border-radius:10px;background:#2457d6;color:white;font-weight:700;font-size:16px}button:disabled{opacity:.6}.panel{display:none;margin-top:20px;padding:16px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0}.status{font-weight:700;margin-bottom:8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.stat{padding:12px;background:white;border:1px solid #e2e8f0;border-radius:10px}.stat small{display:block;color:#667085}.stat b{font-size:20px;overflow-wrap:anywhere}.error{color:#b42318}.success{color:#067647}.warning{color:#9a6700}.note{font-size:13px;margin-top:18px;color:#667085}@media(max-width:450px){.wrap{margin:10px auto}.card{padding:18px}.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><main class="wrap"><section class="card"><h1>KB Loan PDF Importer</h1><div class="muted">Upload borrower list PDF. Parsing and Firestore import run in the background.</div>
+:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#182230;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial}.wrap{max-width:650px;margin:32px auto;padding:16px}.card{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:24px;box-shadow:0 8px 28px #1822300d}h1{font-size:24px;margin:0 0 6px}.muted{color:#667085}.file{display:block;width:100%;margin:20px 0;padding:12px;border:1px dashed #98a2b3;border-radius:10px;background:#fafbff}button{width:100%;padding:13px;border:0;border-radius:10px;background:#2457d6;color:white;font-weight:700;font-size:16px}button:disabled{opacity:.6}.panel{display:none;margin-top:20px;padding:16px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0}.status{font-weight:700;margin-bottom:8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.stat{padding:12px;background:white;border:1px solid #e2e8f0;border-radius:10px}.stat small{display:block;color:#667085}.stat b{font-size:20px;overflow-wrap:anywhere}.error{color:#b42318}.success{color:#067647}.warning{color:#9a6700}.note{font-size:13px;margin-top:18px;color:#667085}.opts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0 4px}.opt{display:block;padding:12px;border:2px solid #e2e8f0;border-radius:12px;cursor:pointer;background:#fff}.opt input{display:none}.opt b{display:block;font-size:14px}.opt small{color:#667085}.opt.on{border-color:#2457d6;background:#eef3ff}.chk{display:none;margin-top:10px;font-size:14px}.chk input{width:auto;margin-right:6px}@media(max-width:450px){.opts{grid-template-columns:1fr}}@media(max-width:450px){.wrap{margin:10px auto}.card{padding:18px}.grid{grid-template-columns:1fr 1fr}}
+</style></head><body><main class="wrap"><section class="card"><h1>KB Loan PDF Importer</h1><div class="muted">Choose what you are uploading. Parsing and Firestore import run in the background.</div>
+<div class="opts"><label class="opt on" id="o1"><input type="radio" name="kind" value="borrower" checked><b>1. Borrower List Uploader</b><small>Loan Monitoring list &rarr; LoanMonthlyData</small></label><label class="opt" id="o2"><input type="radio" name="kind" value="balance"><b>2. All Loan Balance Uploader</b><small>Loan Balance report &rarr; LoanInfo</small></label></div>
+<label class="chk" id="chk"><input type="checkbox" id="replace">Delete all old Loan Info first (tick only when this PDF contains ALL loans)</label>
 <form id="form"><input class="file" id="file" type="file" accept=".pdf,application/pdf" required><button id="btn" type="submit">Upload PDF & Start Import</button></form>
 <div class="panel" id="panel"><div class="status" id="status">Waiting...</div><div class="muted" id="phase"></div><div class="grid" id="stats"></div><div id="details" class="note"></div></div>
-<div class="note">Do not upload the same PDF again while a job is running. Existing LoanMonthlyData is replaced only after parsing and validation pass. Keep the Render service running until the job completes.</div></section></main>
+<div class="note" id="note">Do not upload the same PDF again while a job is running. Existing LoanMonthlyData is replaced only after parsing and validation pass. Keep the Render service running until the job completes.</div></section></main>
 <script>
 const form=document.getElementById('form'),btn=document.getElementById('btn'),panel=document.getElementById('panel');let pollTimer=null;
+const kindEls=[...document.querySelectorAll('input[name=kind]')];const NOTE1=document.getElementById('note').textContent;
+const NOTE2='Loan Info Document ID = programme code + loan case no (e.g. 0307126, 0101342.1). The programme code is taken from the middle 4 digits of Loan Sl. No. Every row and every group Total / Grand Total of the PDF is checked first; if anything does not match, nothing is written. Without the tick above, existing Loan Info is only updated/added to.';
+function kind(){return kindEls.find(x=>x.checked).value}
+function syncKind(){const k=kind();document.getElementById('o1').classList.toggle('on',k==='borrower');document.getElementById('o2').classList.toggle('on',k==='balance');document.getElementById('chk').style.display=k==='balance'?'block':'none';btn.textContent=k==='balance'?'Upload Loan Balance PDF & Start Import':'Upload PDF & Start Import';document.getElementById('note').textContent=k==='balance'?NOTE2:NOTE1}
+kindEls.forEach(x=>x.addEventListener('change',syncKind));syncKind();
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function stat(label,value){return `<div class="stat"><small>${esc(label)}</small><b>${esc(value??0)}</b></div>`}
-form.addEventListener('submit',async e=>{e.preventDefault();if(pollTimer)clearTimeout(pollTimer);const f=document.getElementById('file').files[0];if(!f){alert('Please select a PDF.');return}btn.disabled=true;panel.style.display='block';document.getElementById('status').textContent='Uploading PDF…';document.getElementById('phase').textContent='Please keep this page open to see the live status.';document.getElementById('stats').innerHTML='';document.getElementById('details').textContent='';try{const fd=new FormData();fd.append('file',f);const res=await fetch('/upload',{method:'POST',body:fd});const data=await res.json();if(!res.ok)throw new Error(data.error||'Upload failed');document.getElementById('status').textContent='Upload complete';document.getElementById('phase').textContent='Background job started. You may wait here for the final report.';poll(data.jobId)}catch(err){document.getElementById('status').innerHTML='<span class="error">Upload failed</span>';document.getElementById('details').textContent=err.message;btn.disabled=false}});
-async function poll(id){try{const res=await fetch('/status/'+encodeURIComponent(id),{cache:'no-store'});const j=await res.json();if(!res.ok)throw new Error(j.error||'Status unavailable');document.getElementById('status').innerHTML=j.status==='completed'?'<span class="success">Import completed</span>':j.status==='failed'?'<span class="error">Import failed</span>':'Processing…';document.getElementById('phase').textContent='Current step: '+(j.phase||j.status);document.getElementById('stats').innerHTML=stat('PDF pages',j.totalPages)+stat('Parsed records',j.totalRecords)+stat('Old records deleted',j.deleted)+stat('New records inserted',j.inserted)+stat('Invalid phones',j.invalidPhones)+stat('Missing balances',j.missingBalance)+stat('Parse warnings',(j.parseWarnings||[]).length)+stat('Elapsed seconds',j.elapsedSeconds??'—');let details='File: '+(j.filename||'')+(j.error?'\nError: '+j.error:'');if(j.parseWarnings&&j.parseWarnings.length)details+='\nWarnings (first 8): '+j.parseWarnings.slice(0,8).map(x=>'Page '+x.page+': '+x.reason).join('; ');document.getElementById('details').textContent=details;if(j.status==='completed'||j.status==='failed'){btn.disabled=false;btn.textContent='Upload Another PDF';return}}catch(err){document.getElementById('status').innerHTML='<span class="error">Status check failed</span>';document.getElementById('details').textContent=err.message;btn.disabled=false;return}pollTimer=setTimeout(()=>poll(id),2000)}
+form.addEventListener('submit',async e=>{e.preventDefault();if(pollTimer)clearTimeout(pollTimer);const f=document.getElementById('file').files[0];if(!f){alert('Please select a PDF.');return}btn.disabled=true;panel.style.display='block';document.getElementById('status').textContent='Uploading PDF…';document.getElementById('phase').textContent='Please keep this page open to see the live status.';document.getElementById('stats').innerHTML='';document.getElementById('details').textContent='';try{const fd=new FormData();fd.append('file',f);fd.append('kind',kind());fd.append('replace',document.getElementById('replace').checked?'1':'0');const res=await fetch('/upload',{method:'POST',body:fd});const data=await res.json();if(!res.ok)throw new Error(data.error||'Upload failed');document.getElementById('status').textContent='Upload complete';document.getElementById('phase').textContent='Background job started. You may wait here for the final report.';poll(data.jobId)}catch(err){document.getElementById('status').innerHTML='<span class="error">Upload failed</span>';document.getElementById('details').textContent=err.message;btn.disabled=false}});
+function renderStats(j){if(j.stats)return j.stats.map(x=>stat(x[0],x[1])).join('')+stat('Elapsed seconds',j.elapsedSeconds??'—');return stat('PDF pages',j.totalPages)+stat('Parsed records',j.totalRecords)+stat('Old records deleted',j.deleted)+stat('New records inserted',j.inserted)+stat('Invalid phones',j.invalidPhones)+stat('Missing balances',j.missingBalance)+stat('Parse warnings',(j.parseWarnings||[]).length)+stat('Elapsed seconds',j.elapsedSeconds??'—')}
+async function poll(id){try{const res=await fetch('/status/'+encodeURIComponent(id),{cache:'no-store'});const j=await res.json();if(!res.ok)throw new Error(j.error||'Status unavailable');document.getElementById('status').innerHTML=j.status==='completed'?'<span class="success">Import completed</span>':j.status==='failed'?'<span class="error">Import failed</span>':'Processing…';document.getElementById('phase').textContent='Current step: '+(j.phase||j.status);document.getElementById('stats').innerHTML=renderStats(j);let details='File: '+(j.filename||'')+(j.error?'\nError: '+j.error:'');if(j.parseWarnings&&j.parseWarnings.length)details+='\nWarnings (first 8): '+j.parseWarnings.slice(0,8).map(x=>'Page '+x.page+': '+x.reason).join('; ');document.getElementById('details').textContent=details;if(j.status==='completed'||j.status==='failed'){btn.disabled=false;btn.textContent='Upload Another PDF';return}}catch(err){document.getElementById('status').innerHTML='<span class="error">Status check failed</span>';document.getElementById('details').textContent=err.message;btn.disabled=false;return}pollTimer=setTimeout(()=>poll(id),2000)}
 </script></body></html>'''
 
 if __name__ == "__main__":
