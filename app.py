@@ -537,6 +537,12 @@ def parse_loan_balance_pdf(pdf_path):
                         or money["debit_i"] - money["credit_i"] != money["bal_i"]):
                     warnings.append({"page": page_number, "reason": f"Amounts do not add up at {where}"})
                     continue
+                loan_class = blank_to_none(cells.get("class"))
+                if loan_class is not None:
+                    loan_class = loan_class.upper()
+                    if not re.fullmatch(r"[A-Z]{1,4}", loan_class):
+                        warnings.append({"page": page_number, "reason": f"Unexpected Class value {loan_class!r} at {where}"})
+                        continue
                 start_date = normalize_date(cells.get("start"))
                 duration = parse_number(cells.get("duration", ""))
                 if not start_date or duration is None:
@@ -553,6 +559,7 @@ def parse_loan_balance_pdf(pdf_path):
                         "loanDurationMonths": duration,
                         "balancePrincipal": money["bal_p"],
                         "balanceInterest": money["bal_i"],
+                        "loanClass": loan_class,          # UC / BL ... ; null when the Class column is blank
                     },
                 })
                 group_sum = [group_sum[0] + money["bal_p"], group_sum[1] + money["bal_i"], group_sum[2] + money["bal_t"]]
@@ -594,7 +601,9 @@ def parse_loan_balance_pdf(pdf_path):
                   "report_date": report_date, "branch": branch}
 
 
-def process_loan_balance_file(path, job_id, replace_old):
+def process_loan_balance_file(path, job_id):
+    """Validate the whole PDF first (nothing is touched if anything is wrong), then make LoanInfo
+    exactly equal to this PDF: new/changed rows are written, old rows that are not in the PDF are deleted."""
     started = time.monotonic()
     try:
         set_job(job_id, status="processing", phase="Parsing PDF")
@@ -605,20 +614,32 @@ def process_loan_balance_file(path, job_id, replace_old):
                   ["Report date", stats["report_date"] or "—"], ["Branch", stats["branch"] or "—"]]
         set_job(job_id, phase="Validation complete", totalPages=stats["pages"], totalRecords=stats["records"], stats=report)
         col = db.collection(LOAN_INFO_COLLECTION)
-        deleted = 0
-        if replace_old:
-            set_job(job_id, phase="Deleting old Loan Info", deleted=0, inserted=0)
-            deleted = delete_existing_documents(col, job_id)
-        set_job(job_id, phase="Uploading Loan Info", deleted=deleted, inserted=0)
+        set_job(job_id, phase="Uploading Loan Info", deleted=0, inserted=0)
         inserted = 0
         for start in range(0, len(records), BATCH_SIZE):
             part = records[start:start + BATCH_SIZE]
             batch = db.batch()
             for item in part:
-                batch.set(col.document(item["document_id"]), item["record"])
+                batch.set(col.document(item["document_id"]), item["record"])     # replaces the whole document
             batch.commit()
             inserted += len(part)
             set_job(job_id, phase="Uploading Loan Info", inserted=inserted, totalRecords=len(records))
+
+        # Old Loan Info that is not in this PDF any more (closed / removed loans) is deleted automatically.
+        set_job(job_id, phase="Removing old Loan Info")
+        keep = {item["document_id"] for item in records}
+        stale, deleted = [], 0
+        for doc in col.stream():
+            if doc.reference.id not in keep:
+                stale.append(doc.reference)
+        for start in range(0, len(stale), BATCH_SIZE):
+            batch = db.batch()
+            for ref in stale[start:start + BATCH_SIZE]:
+                batch.delete(ref)
+            batch.commit()
+            deleted += len(stale[start:start + BATCH_SIZE])
+            set_job(job_id, phase="Removing old Loan Info", deleted=deleted)
+
         db.collection(META_COLLECTION).document(LOAN_BALANCE_META_DOCUMENT).set({
             "updateTime": firestore.SERVER_TIMESTAMP,
             "sourceFile": JOBS[job_id].get("filename"),
@@ -626,9 +647,8 @@ def process_loan_balance_file(path, job_id, replace_old):
             "totalPages": stats["pages"],
             "reportDate": stats["report_date"],
             "branch": stats["branch"],
-            "replacedOldData": bool(replace_old),
         }, merge=True)
-        report += [["Old Loan Info deleted", deleted], ["Loan Info inserted / updated", inserted]]
+        report += [["Loan Info inserted / updated", inserted], ["Old Loan Info deleted (not in this PDF)", deleted]]
         set_job(job_id, status="completed", phase="Completed", deleted=deleted, inserted=inserted, stats=report,
                 elapsedSeconds=round(time.monotonic() - started, 2),
                 finishedAt=datetime.utcnow().isoformat(timespec="seconds") + "Z")
@@ -732,7 +752,6 @@ def upload_api():
     if Path(file.filename).suffix.lower() != ".pdf":
         return jsonify({"error": "Only PDF files are allowed."}), 400
     kind = "balance" if request.form.get("kind") == "balance" else "borrower"
-    replace_old = request.form.get("replace") == "1"
     job_id = uuid.uuid4().hex
     safe_name = secure_filename(file.filename) or ("loan-balance.pdf" if kind == "balance" else "borrower-list.pdf")
     temp_path = None
@@ -748,7 +767,7 @@ def upload_api():
                 "totalPages": 0, "totalRecords": 0, "deleted": 0, "inserted": 0,
             }
         if kind == "balance":
-            thread = threading.Thread(target=process_loan_balance_file, args=(temp_path, job_id, replace_old), daemon=True)
+            thread = threading.Thread(target=process_loan_balance_file, args=(temp_path, job_id), daemon=True)
         else:
             thread = threading.Thread(target=process_file, args=(temp_path, job_id), daemon=True)
         thread.start()
@@ -779,23 +798,22 @@ def too_large(_error):
 PAGE_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>KB Loan PDF Importer</title><style>
-:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#182230;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial}.wrap{max-width:650px;margin:32px auto;padding:16px}.card{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:24px;box-shadow:0 8px 28px #1822300d}h1{font-size:24px;margin:0 0 6px}.muted{color:#667085}.file{display:block;width:100%;margin:20px 0;padding:12px;border:1px dashed #98a2b3;border-radius:10px;background:#fafbff}button{width:100%;padding:13px;border:0;border-radius:10px;background:#2457d6;color:white;font-weight:700;font-size:16px}button:disabled{opacity:.6}.panel{display:none;margin-top:20px;padding:16px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0}.status{font-weight:700;margin-bottom:8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.stat{padding:12px;background:white;border:1px solid #e2e8f0;border-radius:10px}.stat small{display:block;color:#667085}.stat b{font-size:20px;overflow-wrap:anywhere}.error{color:#b42318}.success{color:#067647}.warning{color:#9a6700}.note{font-size:13px;margin-top:18px;color:#667085}.opts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0 4px}.opt{display:block;padding:12px;border:2px solid #e2e8f0;border-radius:12px;cursor:pointer;background:#fff}.opt input{display:none}.opt b{display:block;font-size:14px}.opt small{color:#667085}.opt.on{border-color:#2457d6;background:#eef3ff}.chk{display:none;margin-top:10px;font-size:14px}.chk input{width:auto;margin-right:6px}@media(max-width:450px){.opts{grid-template-columns:1fr}}@media(max-width:450px){.wrap{margin:10px auto}.card{padding:18px}.grid{grid-template-columns:1fr 1fr}}
+:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#182230;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial}.wrap{max-width:650px;margin:32px auto;padding:16px}.card{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:24px;box-shadow:0 8px 28px #1822300d}h1{font-size:24px;margin:0 0 6px}.muted{color:#667085}.file{display:block;width:100%;margin:20px 0;padding:12px;border:1px dashed #98a2b3;border-radius:10px;background:#fafbff}button{width:100%;padding:13px;border:0;border-radius:10px;background:#2457d6;color:white;font-weight:700;font-size:16px}button:disabled{opacity:.6}.panel{display:none;margin-top:20px;padding:16px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0}.status{font-weight:700;margin-bottom:8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.stat{padding:12px;background:white;border:1px solid #e2e8f0;border-radius:10px}.stat small{display:block;color:#667085}.stat b{font-size:20px;overflow-wrap:anywhere}.error{color:#b42318}.success{color:#067647}.warning{color:#9a6700}.note{font-size:13px;margin-top:18px;color:#667085}.opts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0 4px}.opt{display:block;padding:12px;border:2px solid #e2e8f0;border-radius:12px;cursor:pointer;background:#fff}.opt input{display:none}.opt b{display:block;font-size:14px}.opt small{color:#667085}.opt.on{border-color:#2457d6;background:#eef3ff}@media(max-width:450px){.opts{grid-template-columns:1fr}}@media(max-width:450px){.wrap{margin:10px auto}.card{padding:18px}.grid{grid-template-columns:1fr 1fr}}
 </style></head><body><main class="wrap"><section class="card"><h1>KB Loan PDF Importer</h1><div class="muted">Choose what you are uploading. Parsing and Firestore import run in the background.</div>
 <div class="opts"><label class="opt on" id="o1"><input type="radio" name="kind" value="borrower" checked><b>1. Borrower List Uploader</b><small>Loan Monitoring list &rarr; LoanMonthlyData</small></label><label class="opt" id="o2"><input type="radio" name="kind" value="balance"><b>2. All Loan Balance Uploader</b><small>Loan Balance report &rarr; LoanInfo</small></label></div>
-<label class="chk" id="chk"><input type="checkbox" id="replace">Delete all old Loan Info first (tick only when this PDF contains ALL loans)</label>
 <form id="form"><input class="file" id="file" type="file" accept=".pdf,application/pdf" required><button id="btn" type="submit">Upload PDF & Start Import</button></form>
 <div class="panel" id="panel"><div class="status" id="status">Waiting...</div><div class="muted" id="phase"></div><div class="grid" id="stats"></div><div id="details" class="note"></div></div>
 <div class="note" id="note">Do not upload the same PDF again while a job is running. Existing LoanMonthlyData is replaced only after parsing and validation pass. Keep the Render service running until the job completes.</div></section></main>
 <script>
 const form=document.getElementById('form'),btn=document.getElementById('btn'),panel=document.getElementById('panel');let pollTimer=null;
 const kindEls=[...document.querySelectorAll('input[name=kind]')];const NOTE1=document.getElementById('note').textContent;
-const NOTE2='Loan Info Document ID = programme code + loan case no (e.g. 0307126, 0101342.1). The programme code is taken from the middle 4 digits of Loan Sl. No. Every row and every group Total / Grand Total of the PDF is checked first; if anything does not match, nothing is written. Without the tick above, existing Loan Info is only updated/added to.';
+const NOTE2='Loan Info Document ID = programme code + loan case no (e.g. 0307126, 0101342.1); the programme code is the middle 4 digits of Loan Sl. No. Every row and every group Total / Grand Total of the PDF is checked first - if anything does not match, nothing is changed. After a successful check Loan Info is replaced automatically: new data is inserted and old records that are not in this PDF are deleted.';
 function kind(){return kindEls.find(x=>x.checked).value}
-function syncKind(){const k=kind();document.getElementById('o1').classList.toggle('on',k==='borrower');document.getElementById('o2').classList.toggle('on',k==='balance');document.getElementById('chk').style.display=k==='balance'?'block':'none';btn.textContent=k==='balance'?'Upload Loan Balance PDF & Start Import':'Upload PDF & Start Import';document.getElementById('note').textContent=k==='balance'?NOTE2:NOTE1}
+function syncKind(){const k=kind();document.getElementById('o1').classList.toggle('on',k==='borrower');document.getElementById('o2').classList.toggle('on',k==='balance');btn.textContent=k==='balance'?'Upload Loan Balance PDF & Start Import':'Upload PDF & Start Import';document.getElementById('note').textContent=k==='balance'?NOTE2:NOTE1}
 kindEls.forEach(x=>x.addEventListener('change',syncKind));syncKind();
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function stat(label,value){return `<div class="stat"><small>${esc(label)}</small><b>${esc(value??0)}</b></div>`}
-form.addEventListener('submit',async e=>{e.preventDefault();if(pollTimer)clearTimeout(pollTimer);const f=document.getElementById('file').files[0];if(!f){alert('Please select a PDF.');return}btn.disabled=true;panel.style.display='block';document.getElementById('status').textContent='Uploading PDF…';document.getElementById('phase').textContent='Please keep this page open to see the live status.';document.getElementById('stats').innerHTML='';document.getElementById('details').textContent='';try{const fd=new FormData();fd.append('file',f);fd.append('kind',kind());fd.append('replace',document.getElementById('replace').checked?'1':'0');const res=await fetch('/upload',{method:'POST',body:fd});const data=await res.json();if(!res.ok)throw new Error(data.error||'Upload failed');document.getElementById('status').textContent='Upload complete';document.getElementById('phase').textContent='Background job started. You may wait here for the final report.';poll(data.jobId)}catch(err){document.getElementById('status').innerHTML='<span class="error">Upload failed</span>';document.getElementById('details').textContent=err.message;btn.disabled=false}});
+form.addEventListener('submit',async e=>{e.preventDefault();if(pollTimer)clearTimeout(pollTimer);const f=document.getElementById('file').files[0];if(!f){alert('Please select a PDF.');return}btn.disabled=true;panel.style.display='block';document.getElementById('status').textContent='Uploading PDF…';document.getElementById('phase').textContent='Please keep this page open to see the live status.';document.getElementById('stats').innerHTML='';document.getElementById('details').textContent='';try{const fd=new FormData();fd.append('file',f);fd.append('kind',kind());const res=await fetch('/upload',{method:'POST',body:fd});const data=await res.json();if(!res.ok)throw new Error(data.error||'Upload failed');document.getElementById('status').textContent='Upload complete';document.getElementById('phase').textContent='Background job started. You may wait here for the final report.';poll(data.jobId)}catch(err){document.getElementById('status').innerHTML='<span class="error">Upload failed</span>';document.getElementById('details').textContent=err.message;btn.disabled=false}});
 function renderStats(j){if(j.stats)return j.stats.map(x=>stat(x[0],x[1])).join('')+stat('Elapsed seconds',j.elapsedSeconds??'—');return stat('PDF pages',j.totalPages)+stat('Parsed records',j.totalRecords)+stat('Old records deleted',j.deleted)+stat('New records inserted',j.inserted)+stat('Invalid phones',j.invalidPhones)+stat('Missing balances',j.missingBalance)+stat('Parse warnings',(j.parseWarnings||[]).length)+stat('Elapsed seconds',j.elapsedSeconds??'—')}
 async function poll(id){try{const res=await fetch('/status/'+encodeURIComponent(id),{cache:'no-store'});const j=await res.json();if(!res.ok)throw new Error(j.error||'Status unavailable');document.getElementById('status').innerHTML=j.status==='completed'?'<span class="success">Import completed</span>':j.status==='failed'?'<span class="error">Import failed</span>':'Processing…';document.getElementById('phase').textContent='Current step: '+(j.phase||j.status);document.getElementById('stats').innerHTML=renderStats(j);let details='File: '+(j.filename||'')+(j.error?'\nError: '+j.error:'');if(j.parseWarnings&&j.parseWarnings.length)details+='\nWarnings (first 8): '+j.parseWarnings.slice(0,8).map(x=>'Page '+x.page+': '+x.reason).join('; ');document.getElementById('details').textContent=details;if(j.status==='completed'||j.status==='failed'){btn.disabled=false;btn.textContent='Upload Another PDF';return}}catch(err){document.getElementById('status').innerHTML='<span class="error">Status check failed</span>';document.getElementById('details').textContent=err.message;btn.disabled=false;return}pollTimer=setTimeout(()=>poll(id),2000)}
 </script></body></html>'''
