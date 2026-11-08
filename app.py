@@ -3,6 +3,10 @@
 Upload window has two options:
   1. Borrower List Uploader      -> LoanMonthlyData (+ MetaData/Loan Data Update)
   2. All Loan Balance Uploader   -> LoanInfo        (+ MetaData/Loan Balance Update)
+
+Document ID rule (both collections): programme code + loan case no,
+where the loan case no has its LEADING ZEROS removed (03 -> 3, 01 -> 1, 0101.1 -> 101.1).
+Example: 0308 + 03 -> 03083, 0309 + 01 -> 03091.
 """
 from __future__ import annotations
 
@@ -57,6 +61,15 @@ def clean_cell(value):
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def normalize_case_no(value):
+    """Remove leading zeros from the loan case no. The decimal part is kept as is.
+    03 -> 3, 01 -> 1, 007 -> 7, 0101.1 -> 101.1, 00 -> 0, 342.1 -> 342.1"""
+    text = clean_cell(value)
+    whole, dot, frac = text.partition(".")
+    whole = whole.lstrip("0") or "0"
+    return whole + dot + frac
 
 
 def blank_to_none(value):
@@ -166,7 +179,7 @@ def row_to_record(row, program_code, program_name, loan_status, account_code, pa
     if len(row) < 21:
         return None, "wrong_column_count"
     sl_no = clean_cell(row[0])
-    case_no = clean_cell(row[1])
+    case_no = normalize_case_no(row[1])
     customer_name = clean_cell(row[2])
     if not re.fullmatch(r"\d+", sl_no) or not re.fullmatch(r"\d+(?:\.\d+)?", case_no):
         return None, "not_data_row"
@@ -376,7 +389,8 @@ def parse_pdf(pdf_path):
         program_code, program_name = raw["program_code"], raw["program_name"]
         loan_status, account_code = raw["loan_status"], raw["account_code"]
         row = row_cells(raw["col_lines"], start)
-        case_no = clean_cell(row[1])
+        # Leading zeros removed so the document id matches LoanInfo (03 -> 3).
+        case_no = normalize_case_no(row[1])
         customer_name = clean_cell(row[2])
         if not re.fullmatch(r"\d+(?:\.\d+)?", case_no):
             parse_warnings.append({"page": page_number, "reason": f"Invalid loan case number at Sl. {start['sl_no']}"})
@@ -453,7 +467,8 @@ def parse_pdf(pdf_path):
 
 # =====================================================================================
 #  ALL LOAN BALANCE UPLOADER  ->  Firestore collection "LoanInfo"
-#  Document id = programme code + loan case no   (e.g. 0307126, 0101342.1)
+#  Document id = programme code + loan case no (leading zeros removed)
+#  (e.g. 0307126, 0101342.1, 0308 + 03 -> 03083)
 #  Programme code is NOT printed as a column: it is the middle 4 digits of "Loan Sl. No."
 #  (0522-0101-00436 -> 0101).
 # =====================================================================================
@@ -520,7 +535,8 @@ def parse_loan_balance_pdf(pdf_path):
                         cells[column] = (cells.get(column, "") + " " + word["text"]).strip()
                 serial = serial_word["text"]
                 branch_code, program_code, running_no = LB_SERIAL_RE.match(serial).groups()
-                case_no = clean_cell(cells.get("case", ""))
+                # Leading zeros removed so the document id matches LoanMonthlyData (03 -> 3).
+                case_no = normalize_case_no(cells.get("case", ""))
                 where = f"page {page_number}, Loan Sl. No. {serial}"
                 if not LB_CASE_RE.match(case_no):
                     warnings.append({"page": page_number, "reason": f"Invalid loan case number at {where}"})
@@ -807,7 +823,7 @@ PAGE_HTML = r'''<!doctype html>
 <script>
 const form=document.getElementById('form'),btn=document.getElementById('btn'),panel=document.getElementById('panel');let pollTimer=null;
 const kindEls=[...document.querySelectorAll('input[name=kind]')];const NOTE1=document.getElementById('note').textContent;
-const NOTE2='Loan Info Document ID = programme code + loan case no (e.g. 0307126, 0101342.1); the programme code is the middle 4 digits of Loan Sl. No. Every row and every group Total / Grand Total of the PDF is checked first - if anything does not match, nothing is changed. After a successful check Loan Info is replaced automatically: new data is inserted and old records that are not in this PDF are deleted.';
+const NOTE2='Loan Info Document ID = programme code + loan case no with leading zeros removed (e.g. 0307126, 0101342.1, 0308 + 03 = 03083); the programme code is the middle 4 digits of Loan Sl. No. Every row and every group Total / Grand Total of the PDF is checked first - if anything does not match, nothing is changed. After a successful check Loan Info is replaced automatically: new data is inserted and old records that are not in this PDF are deleted.';
 function kind(){return kindEls.find(x=>x.checked).value}
 function syncKind(){const k=kind();document.getElementById('o1').classList.toggle('on',k==='borrower');document.getElementById('o2').classList.toggle('on',k==='balance');btn.textContent=k==='balance'?'Upload Loan Balance PDF & Start Import':'Upload PDF & Start Import';document.getElementById('note').textContent=k==='balance'?NOTE2:NOTE1}
 kindEls.forEach(x=>x.addEventListener('change',syncKind));syncKind();
