@@ -1,4 +1,4 @@
-"""KB Loan PDF importer. Render + Flask + Firebase Firestore.
+"""KB Loan PDF importer. Render + Flask + Firebase Firestore (multi-branch).
 
 Upload window has two options:
   1. Borrower List Uploader      -> LoanMonthlyData (+ MetaData/Loan Data Update)
@@ -10,6 +10,7 @@ Example: 0308 + 03 -> 03083, 0309 + 01 -> 03091.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -23,7 +24,8 @@ from pathlib import Path
 import pdfplumber
 import firebase_admin
 from firebase_admin import credentials, firestore
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 COLLECTION = "LoanMonthlyData"
@@ -38,21 +40,96 @@ MAX_UPLOAD_MB = 40
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
-# Render Environment Variable: FIREBASE_KEY = complete Firebase service-account JSON.
-firebase_json = os.environ.get("FIREBASE_KEY", "").strip()
-if not firebase_json:
-    raise RuntimeError("FIREBASE_KEY environment variable is missing. Add the Firebase service-account JSON in Render Environment.")
-try:
-    firebase_dict = json.loads(firebase_json)
-except json.JSONDecodeError as exc:
-    raise RuntimeError("FIREBASE_KEY must contain valid JSON for the Firebase service account.") from exc
+# One Render environment variable PER BRANCH:  FIREBASE_KEY_0536 = <service-account JSON of branch 0536>
+#                                              FIREBASE_KEY_0522 = <service-account JSON of branch 0522> ...
+# (Optional old style also works: FIREBASE_KEYS = {"0536": {...}, "0522": {...}})
+firebase_keys: dict = {}
+raw_keys = os.environ.get("FIREBASE_KEYS", "").strip()
+if raw_keys:
+    try:
+        parsed = json.loads(raw_keys)
+        if not isinstance(parsed, dict):
+            raise ValueError("not an object")
+        firebase_keys.update({str(k): v for k, v in parsed.items()})
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError("FIREBASE_KEYS must be valid JSON: {\"0536\": {...}, \"0522\": {...}}") from exc
+for _name, _value in os.environ.items():
+    if _name.startswith("FIREBASE_KEY_") and _value.strip():
+        _code = _name[len("FIREBASE_KEY_"):].strip()
+        try:
+            firebase_keys[_code] = json.loads(_value)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{_name} must contain the complete Firebase service-account JSON.") from exc
+if not firebase_keys:
+    raise RuntimeError("No Firebase key found. Add one environment variable per branch, e.g. FIREBASE_KEY_0536 = service-account JSON.")
 
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(credentials.Certificate(firebase_dict))
-db = firestore.client()
+CLIENTS: dict[str, "firestore.Client"] = {}
+for _code, _cfg in firebase_keys.items():
+    _fb_app = firebase_admin.initialize_app(credentials.Certificate(_cfg), name=str(_code))
+    CLIENTS[str(_code)] = firestore.client(_fb_app)
 
-# In-process job status. A job continues after the upload HTTP response, while this Render
-# instance remains alive. A process restart stops in-memory jobs; see README for this limit.
+# Who may upload: Admin, or any active user whose "permissions" list contains "loan-upload"
+# (granted in the web app's Permission Management). The web app sends GPF + password; they are checked
+# against the Users collection of the chosen branch, the same way the web app signs in.
+UPLOAD_PERMISSION = "loan-upload"
+ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*").strip()
+CORS(app, origins=[o.strip().rstrip("/") for o in ALLOWED_ORIGIN.split(",") if o.strip()] or "*")
+
+# The processing code below uses the name `db`. It now points to the client of the branch that
+# the current background thread is working for (set in run_job).
+_ctx = threading.local()
+
+
+class _DbProxy:
+    def __getattr__(self, name):
+        client = getattr(_ctx, "client", None)
+        if client is None:
+            raise RuntimeError("No branch selected for this job.")
+        return getattr(client, name)
+
+
+db = _DbProxy()
+
+# Simple brute-force guard: 5 wrong passwords -> 10 minutes lock for that branch + GPF.
+FAILS: dict[str, list] = {}
+FAILS_LOCK = threading.Lock()
+
+
+def check_uploader(branch, gpf, password):
+    """Return (user_dict, None) when allowed, else (None, (message, http_status))."""
+    branch, gpf, password = str(branch or "").strip(), str(gpf or "").strip(), str(password or "")
+    client = CLIENTS.get(branch)
+    if not client:
+        return None, ("Unknown branch.", 400)
+    if not gpf or not password:
+        return None, ("GPF number and password are required.", 401)
+    key = f"{branch}:{gpf}"
+    now = time.time()
+    with FAILS_LOCK:
+        count, last = FAILS.get(key, [0, 0])
+        if count >= 5 and now - last < 600:
+            return None, ("Too many wrong attempts. Try again after 10 minutes.", 429)
+        if now - last >= 600:
+            count = 0
+    snap = client.collection("Users").document(gpf).get()
+    user = snap.to_dict() if snap.exists else None
+    ok = bool(user) and hmac.compare_digest(str(user.get("password", "")), password)
+    if not ok:
+        with FAILS_LOCK:
+            FAILS[key] = [count + 1, now]
+        return None, ("Wrong GPF number or password.", 401)
+    with FAILS_LOCK:
+        FAILS.pop(key, None)
+    if user.get("status") != "active":
+        return None, ("This account is not active.", 403)
+    perms = user.get("permissions")
+    if user.get("role") != "Admin" and not (isinstance(perms, list) and UPLOAD_PERMISSION in perms):
+        return None, ("You do not have permission to upload. Ask the Admin to give you Loan Upload access.", 403)
+    return user, None
+
+
+# In-process job status. A job continues after the upload HTTP response, while this Render instance
+# remains alive. A restart stops in-memory jobs, so run gunicorn with ONE worker (see Start Command in SETUP-STEPS.md).
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
@@ -755,9 +832,15 @@ def process_file(path, job_id):
             pass
 
 
+def run_job(target, path, job_id, branch):
+    """Runs one import in a background thread, bound to the chosen branch's Firestore."""
+    _ctx.client = CLIENTS[branch]
+    target(path, job_id)
+
+
 @app.get("/")
 def home():
-    return render_template_string(PAGE_HTML)
+    return jsonify({"service": "KB Loan PDF importer", "status": "running", "branches": sorted(CLIENTS)})
 
 
 @app.post("/upload")
@@ -767,6 +850,10 @@ def upload_api():
         return jsonify({"error": "Please choose a PDF file."}), 400
     if Path(file.filename).suffix.lower() != ".pdf":
         return jsonify({"error": "Only PDF files are allowed."}), 400
+    branch = str(request.form.get("branch", "")).strip()
+    _user, denied = check_uploader(branch, request.form.get("gpf"), request.form.get("password"))
+    if denied:
+        return jsonify({"error": denied[0]}), denied[1]
     kind = "balance" if request.form.get("kind") == "balance" else "borrower"
     job_id = uuid.uuid4().hex
     safe_name = secure_filename(file.filename) or ("loan-balance.pdf" if kind == "balance" else "borrower-list.pdf")
@@ -777,15 +864,13 @@ def upload_api():
             file.save(tmp)
         with JOBS_LOCK:
             JOBS[job_id] = {
-                "jobId": job_id, "filename": safe_name, "kind": kind, "status": "queued", "phase": "Queued",
+                "jobId": job_id, "filename": safe_name, "kind": kind, "branch": branch, "status": "queued", "phase": "Queued",
                 "createdAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 "updatedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 "totalPages": 0, "totalRecords": 0, "deleted": 0, "inserted": 0,
             }
-        if kind == "balance":
-            thread = threading.Thread(target=process_loan_balance_file, args=(temp_path, job_id), daemon=True)
-        else:
-            thread = threading.Thread(target=process_file, args=(temp_path, job_id), daemon=True)
+        target = process_loan_balance_file if kind == "balance" else process_file
+        thread = threading.Thread(target=run_job, args=(target, temp_path, job_id, branch), daemon=True)
         thread.start()
         return jsonify({"jobId": job_id, "status": "queued", "message": "PDF uploaded. Background processing started."}), 202
     except Exception as exc:
@@ -800,7 +885,7 @@ def job_status(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if not job:
-            return jsonify({"error": "Job not found. The Render process may have restarted, or the job ID is invalid."}), 404
+            return jsonify({"error": "Job not found. The Render service may have restarted, or the job ID is invalid."}), 404
         result = dict(job)
     # Do not expose internal error tracebacks or credentials.
     return jsonify(result)
@@ -810,29 +895,6 @@ def job_status(job_id):
 def too_large(_error):
     return jsonify({"error": f"PDF is too large. Maximum upload size is {MAX_UPLOAD_MB} MB."}), 413
 
-
-PAGE_HTML = r'''<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>KB Loan PDF Importer</title><style>
-:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#182230;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial}.wrap{max-width:650px;margin:32px auto;padding:16px}.card{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:24px;box-shadow:0 8px 28px #1822300d}h1{font-size:24px;margin:0 0 6px}.muted{color:#667085}.file{display:block;width:100%;margin:20px 0;padding:12px;border:1px dashed #98a2b3;border-radius:10px;background:#fafbff}button{width:100%;padding:13px;border:0;border-radius:10px;background:#2457d6;color:white;font-weight:700;font-size:16px}button:disabled{opacity:.6}.panel{display:none;margin-top:20px;padding:16px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0}.status{font-weight:700;margin-bottom:8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.stat{padding:12px;background:white;border:1px solid #e2e8f0;border-radius:10px}.stat small{display:block;color:#667085}.stat b{font-size:20px;overflow-wrap:anywhere}.error{color:#b42318}.success{color:#067647}.warning{color:#9a6700}.note{font-size:13px;margin-top:18px;color:#667085}.opts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0 4px}.opt{display:block;padding:12px;border:2px solid #e2e8f0;border-radius:12px;cursor:pointer;background:#fff}.opt input{display:none}.opt b{display:block;font-size:14px}.opt small{color:#667085}.opt.on{border-color:#2457d6;background:#eef3ff}@media(max-width:450px){.opts{grid-template-columns:1fr}}@media(max-width:450px){.wrap{margin:10px auto}.card{padding:18px}.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><main class="wrap"><section class="card"><h1>KB Loan PDF Importer</h1><div class="muted">Choose what you are uploading. Parsing and Firestore import run in the background.</div>
-<div class="opts"><label class="opt on" id="o1"><input type="radio" name="kind" value="borrower" checked><b>1. Borrower List Uploader</b><small>Loan Monitoring list &rarr; LoanMonthlyData</small></label><label class="opt" id="o2"><input type="radio" name="kind" value="balance"><b>2. All Loan Balance Uploader</b><small>Loan Balance report &rarr; LoanInfo</small></label></div>
-<form id="form"><input class="file" id="file" type="file" accept=".pdf,application/pdf" required><button id="btn" type="submit">Upload PDF & Start Import</button></form>
-<div class="panel" id="panel"><div class="status" id="status">Waiting...</div><div class="muted" id="phase"></div><div class="grid" id="stats"></div><div id="details" class="note"></div></div>
-<div class="note" id="note">Do not upload the same PDF again while a job is running. Existing LoanMonthlyData is replaced only after parsing and validation pass. Keep the Render service running until the job completes.</div></section></main>
-<script>
-const form=document.getElementById('form'),btn=document.getElementById('btn'),panel=document.getElementById('panel');let pollTimer=null;
-const kindEls=[...document.querySelectorAll('input[name=kind]')];const NOTE1=document.getElementById('note').textContent;
-const NOTE2='Loan Info Document ID = programme code + loan case no with leading zeros removed (e.g. 0307126, 0101342.1, 0308 + 03 = 03083); the programme code is the middle 4 digits of Loan Sl. No. Every row and every group Total / Grand Total of the PDF is checked first - if anything does not match, nothing is changed. After a successful check Loan Info is replaced automatically: new data is inserted and old records that are not in this PDF are deleted.';
-function kind(){return kindEls.find(x=>x.checked).value}
-function syncKind(){const k=kind();document.getElementById('o1').classList.toggle('on',k==='borrower');document.getElementById('o2').classList.toggle('on',k==='balance');btn.textContent=k==='balance'?'Upload Loan Balance PDF & Start Import':'Upload PDF & Start Import';document.getElementById('note').textContent=k==='balance'?NOTE2:NOTE1}
-kindEls.forEach(x=>x.addEventListener('change',syncKind));syncKind();
-const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function stat(label,value){return `<div class="stat"><small>${esc(label)}</small><b>${esc(value??0)}</b></div>`}
-form.addEventListener('submit',async e=>{e.preventDefault();if(pollTimer)clearTimeout(pollTimer);const f=document.getElementById('file').files[0];if(!f){alert('Please select a PDF.');return}btn.disabled=true;panel.style.display='block';document.getElementById('status').textContent='Uploading PDF…';document.getElementById('phase').textContent='Please keep this page open to see the live status.';document.getElementById('stats').innerHTML='';document.getElementById('details').textContent='';try{const fd=new FormData();fd.append('file',f);fd.append('kind',kind());const res=await fetch('/upload',{method:'POST',body:fd});const data=await res.json();if(!res.ok)throw new Error(data.error||'Upload failed');document.getElementById('status').textContent='Upload complete';document.getElementById('phase').textContent='Background job started. You may wait here for the final report.';poll(data.jobId)}catch(err){document.getElementById('status').innerHTML='<span class="error">Upload failed</span>';document.getElementById('details').textContent=err.message;btn.disabled=false}});
-function renderStats(j){if(j.stats)return j.stats.map(x=>stat(x[0],x[1])).join('')+stat('Elapsed seconds',j.elapsedSeconds??'—');return stat('PDF pages',j.totalPages)+stat('Parsed records',j.totalRecords)+stat('Old records deleted',j.deleted)+stat('New records inserted',j.inserted)+stat('Invalid phones',j.invalidPhones)+stat('Missing balances',j.missingBalance)+stat('Parse warnings',(j.parseWarnings||[]).length)+stat('Elapsed seconds',j.elapsedSeconds??'—')}
-async function poll(id){try{const res=await fetch('/status/'+encodeURIComponent(id),{cache:'no-store'});const j=await res.json();if(!res.ok)throw new Error(j.error||'Status unavailable');document.getElementById('status').innerHTML=j.status==='completed'?'<span class="success">Import completed</span>':j.status==='failed'?'<span class="error">Import failed</span>':'Processing…';document.getElementById('phase').textContent='Current step: '+(j.phase||j.status);document.getElementById('stats').innerHTML=renderStats(j);let details='File: '+(j.filename||'')+(j.error?'\nError: '+j.error:'');if(j.parseWarnings&&j.parseWarnings.length)details+='\nWarnings (first 8): '+j.parseWarnings.slice(0,8).map(x=>'Page '+x.page+': '+x.reason).join('; ');document.getElementById('details').textContent=details;if(j.status==='completed'||j.status==='failed'){btn.disabled=false;btn.textContent='Upload Another PDF';return}}catch(err){document.getElementById('status').innerHTML='<span class="error">Status check failed</span>';document.getElementById('details').textContent=err.message;btn.disabled=false;return}pollTimer=setTimeout(()=>poll(id),2000)}
-</script></body></html>'''
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)
