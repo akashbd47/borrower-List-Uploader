@@ -238,9 +238,9 @@ def context_for_table(lines, table_top, previous_program, previous_program_name,
                 program = match.group(1).strip()
                 program_name = clean_cell(match.group(2))
         # Account code heading, e.g. Overdue( 100103 ) or Regular( 100101 ).
-        match = re.search(r"\b(Overdue|Regular)\s*\(\s*(\d{6})\s*\)", text, re.I)
+        match = re.search(r"\b(Overdue|Regular|Write[-\s]?off)\s*\(\s*(\d{6})\s*\)", text, re.I)
         if match:
-            status = match.group(1).title()
+            status = re.sub(r"\s+", "", match.group(1)).title()
             account = match.group(2)
     return program, program_name, status, account
 
@@ -447,9 +447,9 @@ def parse_pdf(pdf_path):
                     if match:
                         program_code = match.group(1)
                         program_name = clean_cell(match.group(2)) or None
-                    match = re.search(r"\b(Overdue|Regular)\s*\(\s*(\d{6})\s*\)", text, re.I)
+                    match = re.search(r"\b(Overdue|Regular|Write[-\s]?off)\s*\(\s*(\d{6})\s*\)", text, re.I)
                     if match:
-                        loan_status = match.group(1).title()
+                        loan_status = re.sub(r"\s+", "", match.group(1)).title()
                         account_code = match.group(2)
                 line_cursor = start["line_index"] + 1
                 next_top = starts[row_index + 1]["top"] if row_index + 1 < len(starts) else float("inf")
